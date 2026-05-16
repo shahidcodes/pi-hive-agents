@@ -1,0 +1,6 @@
+{
+  "name": "hive-agent",
+  "pi": {
+    "extensions": ["./src/index.ts"]
+  }
+}
