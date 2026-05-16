@@ -85,6 +85,7 @@ interface AgentDefinitionInput {
 const agents = new Map<string, AgentJob>();
 let nextId = 0;
 let savedCtx: any = null;
+let savedPi: any = null;
 let pollTimer: ReturnType<typeof setInterval> | null = null;
 let notifiedIds = new Set<string>();
 
@@ -462,7 +463,7 @@ async function spawnAgentJob(
  * This injects a message into the main agent's conversation so it knows an agent finished.
  */
 function notifyOrchestrator(job: AgentJob) {
-  if (!savedCtx || !savedCtx.hasUI) return;
+  if (!savedCtx || !savedCtx.hasUI || !savedPi) return;
 
   const output = getFinalOutput(job.messages);
   const preview = output.length > 500 ? output.slice(0, 500) + "…" : output || "(no output)";
@@ -843,6 +844,7 @@ async function showHiveDashboard(ctx: any): Promise<void> {
 export default function (pi: ExtensionAPI) {
   pi.on("session_start", async (_event, ctx) => {
     savedCtx = ctx;
+    savedPi = pi;
 
     // Kill any stale agents from previous session
     for (const job of agents.values()) {
