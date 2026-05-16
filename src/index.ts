@@ -250,18 +250,20 @@ function updateWidget() {
         job.usage.cost > 0
           ? theme.fg("dim", `$${job.usage.cost.toFixed(4)}`)
           : "";
-      // Show current activity for running agents
+      // Show current activity for running agents (truncated)
       const activityStr =
         job.status === "running" || job.status === "spawning"
-          ? `  ${theme.fg("dim", `› ${job.currentActivity}`)}`
+          ? `  ${theme.fg("dim", `› ${job.currentActivity.slice(0, 80)}`)}`
           : "";
 
       lines.push(`   ${nameStr} ${roleStr}  ${elapsedStr} ${jobCost}${activityStr}`);
     }
 
     return {
-      render: () => lines,
-      invalidate: () => {},
+      render: (w: number): string[] => {
+        return lines.map((line) => truncateToWidth(line, w));
+      },
+      invalidate() {},
     };
   });
 }
@@ -633,7 +635,7 @@ function createAgentViewer(
 
       // Header
       const icon = statusIcon(job.status);
-      const header = `${icon} ${theme.fg("accent", theme.bold(job.name))} — ${theme.fg("muted", job.role)}`;
+      const header = truncateToWidth(`${icon} ${theme.fg("accent", theme.bold(job.name))} — ${theme.fg("muted", job.role)}`, width);
       container.addChild(new Text(header, 1, 0));
 
       // Status bar with live activity
@@ -645,7 +647,7 @@ function createAgentViewer(
           : "";
       container.addChild(
         new Text(
-          theme.fg("dim", `${statusLine}  ·  ${usageLine}`) + activityLine,
+          truncateToWidth(theme.fg("dim", `${statusLine}  ·  ${usageLine}`) + activityLine, width),
           1,
           0,
         ),
@@ -654,7 +656,7 @@ function createAgentViewer(
 
       // Task
       container.addChild(new Text(theme.fg("muted", "─── Task ───"), 1, 0));
-      container.addChild(new Text(theme.fg("dim", job.task), 1, 0));
+      container.addChild(new Text(truncateToWidth(theme.fg("dim", job.task), width), 1, 0));
       container.addChild(new Spacer(1));
 
       // Output — streaming text for running agents
@@ -707,8 +709,11 @@ function createAgentViewer(
               }
               container.addChild(
                 new Text(
-                  theme.fg("dim", `  → ${toolName}`) +
-                  (detail ? theme.fg("muted", ` ${detail}`) : ""),
+                  truncateToWidth(
+                    theme.fg("dim", `  → ${toolName}`) +
+                    (detail ? theme.fg("muted", ` ${detail}`) : ""),
+                    width,
+                  ),
                   1,
                   0,
                 ),
@@ -729,17 +734,19 @@ function createAgentViewer(
             ? job.stderr.slice(0, 300) + "..."
             : job.stderr;
         container.addChild(
-          new Text(theme.fg("error", stderrPreview), 1, 0),
+          new Text(truncateToWidth(theme.fg("error", stderrPreview), width), 1, 0),
         );
       }
 
       container.addChild(new Spacer(1));
-      const backHint = theme.fg("dim", "esc / backspace — back to agent list");
-      const liveHint =
-        job.status === "running" || job.status === "spawning"
+      const backHint = truncateToWidth(
+        theme.fg("dim", "esc / backspace — back to agent list") +
+        ((job.status === "running" || job.status === "spawning")
           ? " " + theme.fg("warning", "[live]")
-          : "";
-      container.addChild(new Text(backHint + liveHint, 1, 0));
+          : ""),
+        width,
+      );
+      container.addChild(new Text(backHint, 1, 0));
 
       return container.render(width);
     },
@@ -885,7 +892,7 @@ export default function (pi: ExtensionAPI) {
     const runningLines =
       running.length > 0
         ? running
-            .map((j) => `  - \`${j.name}\` (${j.role}): ⏳ ${j.currentActivity}`)
+            .map((j) => `  - \`${j.name}\` (${j.role}): ⏳ ${j.currentActivity.slice(0, 100)}`)
             .join("\n")
         : "  (none)";
     const completedLines =
