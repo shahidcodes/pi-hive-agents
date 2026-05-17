@@ -151,9 +151,22 @@ hive_followup({
 
 | Key | Action |
 |-----|--------|
+| `/hive-mode on` | Enable orchestrator mode — main agent delegates via hive_spawn |
+| `/hive-mode off` | Disable orchestrator mode — main agent works normally |
+| `/hive-mode` | Show current orchestrator mode status |
 | `/hive` | Open the agent dashboard |
 | `/hive-kill` | Kill all running agents |
 | `Ctrl+Shift+H` | Quick view of running agents |
+
+### Orchestrator Mode
+
+By default, **orchestrator mode is OFF**. The main agent works normally — the hive tools are available but it won't be forced to delegate.
+
+- **Quick tasks** — just type normally, the main agent handles it directly
+- **Complex tasks** — the main agent can still choose to use `hive_spawn` based on the tool descriptions
+- **Strict delegation** — run `/hive-mode on` to force the main agent to always delegate to sub-agents
+
+The mode resets to `off` on every new session.
 
 ## Per-Agent Model & Thinking
 

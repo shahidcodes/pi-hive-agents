@@ -105,6 +105,7 @@ let savedCtx: any = null;
 let savedPi: any = null;
 let pollTimer: ReturnType<typeof setInterval> | null = null;
 let notifiedIds = new Set<string>();
+let orchestratorMode = false;
 
 // ─── Helpers ──────────────────────────────────────────────────────────────
 
@@ -827,6 +828,7 @@ export default function (pi: ExtensionAPI) {
     agents.clear();
     nextId = 0;
     notifiedIds.clear();
+    orchestratorMode = false;
 
     // Start the 30s polling loop
     startPolling(ctx);
@@ -850,9 +852,10 @@ export default function (pi: ExtensionAPI) {
     stopPolling();
   });
 
-  // ── Inject orchestrator system prompt every turn ──────────────────────
+  // ── Inject orchestrator system prompt (only when enabled) ───────────
 
   pi.on("before_agent_start", async (event, _ctx) => {
+    if (!orchestratorMode) return;
     const running = Array.from(agents.values()).filter(
       (j) => j.status === "running" || j.status === "spawning",
     );
@@ -1491,6 +1494,31 @@ ${completedLines}
         return;
       }
       await showHiveDashboard(ctx);
+    },
+  });
+
+  // ── Register /hive-mode command ──────────────────────────────────────
+
+  pi.registerCommand("hive-mode", {
+    description: "Toggle hive orchestrator mode on/off",
+    getArgumentCompletions: (prefix: string) => {
+      const items = [{ value: "on", label: "on" }, { value: "off", label: "off" }];
+      const filtered = items.filter((i) => i.value.startsWith(prefix.toLowerCase()));
+      return filtered.length > 0 ? filtered : null;
+    },
+    handler: async (args, ctx) => {
+      const arg = (args || "").trim().toLowerCase();
+      if (arg === "on") {
+        orchestratorMode = true;
+        ctx.ui.notify("Hive orchestrator mode ON — main agent will delegate via hive_spawn", "info");
+      } else if (arg === "off") {
+        orchestratorMode = false;
+        ctx.ui.notify("Hive orchestrator mode OFF — main agent will work normally (tools still available)", "info");
+      } else if (arg === "" || arg === "status") {
+        ctx.ui.notify(`Hive orchestrator mode: ${orchestratorMode ? "ON" : "OFF"}`, "info");
+      } else {
+        ctx.ui.notify(`Usage: /hive-mode [on|off|status]`, "warning");
+      }
     },
   });
 
