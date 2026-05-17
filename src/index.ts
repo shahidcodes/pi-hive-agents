@@ -783,33 +783,29 @@ async function showHiveDashboard(ctx: any): Promise<void> {
   }
 
   // Phase 1: Show agent selector
-  const selectedJob = await new Promise<AgentJob | null>((resolve) => {
-    ctx.ui.custom<AgentJob | null>(
-      (tui, theme, _kb, done) =>
-        createAgentSelector(
-          theme,
-          tui,
-          (job) => done(job),
-          () => done(null),
-        ),
-      { overlay: true },
-    );
-  });
+  const selectedJob = await ctx.ui.custom<AgentJob | null>(
+    (tui, theme, _kb, done) =>
+      createAgentSelector(
+        theme,
+        tui,
+        (job) => done(job),
+        () => done(null),
+      ),
+    { overlay: true },
+  );
 
   if (!selectedJob) return;
 
   // Phase 2: Show agent detail viewer with live updates
-  await new Promise<void>((resolve) => {
-    ctx.ui.custom<void>(
-      (tui, theme, _kb, done) => {
-        const component = createAgentViewer(selectedJob, theme, tui, () =>
-          done(),
-        );
-        return component;
-      },
-      { overlay: true },
-    );
-  });
+  await ctx.ui.custom<void>(
+    (tui, theme, _kb, done) => {
+      const component = createAgentViewer(selectedJob, theme, tui, () =>
+        done(),
+      );
+      return component;
+    },
+    { overlay: true },
+  );
 }
 
 // ─── Extension ────────────────────────────────────────────────────────────
