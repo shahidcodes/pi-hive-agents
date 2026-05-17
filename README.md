@@ -98,25 +98,54 @@ hive_inbox({ agent: "frontend-dev" })
 
 ### `hive_steer`
 
-Send an instruction to a **running** agent. The agent receives it immediately and adjusts its work.
+Sends an instruction to a running agent **immediately**. The agent stops what it's doing and follows the new direction.
+
+**Use when:** You see the agent going in the wrong direction and need to correct it now.
 
 ```
 hive_steer({
   agent: "frontend-dev",
-  instruction: "Make the layout mobile-first and add dark mode support"
+  instruction: "Make this mobile-first. Start with 320px viewport and scale up."
+})
+
+hive_steer({
+  agent: "backend-dev",
+  instruction: "Switch to GraphQL instead. Define the schema with types for User, Post, and Comment."
+})
+
+hive_steer({
+  agent: "researcher",
+  instruction: "Focus on 2025-2026 resources only. Ignore anything before 2025."
 })
 ```
 
 ### `hive_followup`
 
-Queue an instruction for a running agent. It will process it **after** completing current work.
+Queues an instruction that the agent will process **after** completing its current work. Use this to add tasks without interrupting the current flow.
+
+**Use when:** The agent is on the right track but you want to add more work after it finishes.
 
 ```
 hive_followup({
+  agent: "frontend-dev",
+  instruction: "After the layout is done, also add a dark mode toggle component."
+})
+
+hive_followup({
   agent: "backend-dev",
-  instruction: "Also add rate limiting to the auth endpoints"
+  instruction: "Once the routes are done, write integration tests for each endpoint."
 })
 ```
+
+### Steering vs Followup — Quick Guide
+
+| Situation | Use | Why |
+|-----------|-----|-----|
+| Agent is going in the wrong direction | `hive_steer` | Stop it now, redirect |
+| Agent needs additional requirements | `hive_followup` | Let it finish, then add more |
+| Agent misunderstood the task | `hive_steer` | Clarify immediately |
+| You thought of a bonus task | `hive_followup` | Queue it for after completion |
+| Agent's output quality is poor | `hive_steer` | Correct the approach mid-flight |
 
 ## Commands & Shortcuts
 
