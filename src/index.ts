@@ -254,15 +254,16 @@ function updateWidget() {
 async function spawnAgentJob(
   cwd: string,
   job: AgentJob,
+  fallbackModel: any,
 ): Promise<void> {
   try {
     const authStorage = AuthStorage.create();
     const modelRegistry = ModelRegistry.create(authStorage);
 
-    // Resolve model if specified
+    // Resolve model: use requested model, or fall back to main agent's model
     let model = undefined;
     if (job.requestedModel) {
-      // Try to find the model (supports "provider/id" format)
+      // Try to find the requested model (supports "provider/id" format)
       const parts = job.requestedModel.includes("/")
         ? job.requestedModel.split("/")
         : ["", job.requestedModel];
@@ -280,6 +281,10 @@ async function spawnAgentJob(
         const found = modelRegistry.find(provider, modelId);
         if (found) model = found;
       }
+    }
+    // If no explicit model requested, inherit the main agent's model
+    if (!model && fallbackModel) {
+      model = fallbackModel;
     }
 
     const systemPromptFull =
@@ -966,7 +971,8 @@ ${completedLines}
         agents.set(id, job);
 
         // Spawn each agent in background (non-blocking)
-        spawnAgentJob(ctx.cwd, job).catch((err) => {
+        // Pass main agent's model as the default for sub-agents
+        spawnAgentJob(ctx.cwd, job, ctx.model).catch((err) => {
           job.status = "failed";
           job.stderr = String(err);
           job.endedAt = Date.now();
