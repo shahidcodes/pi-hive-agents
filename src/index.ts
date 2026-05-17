@@ -22,10 +22,16 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { Message } from "@earendil-works/pi-ai";
+import { StringEnum } from "@earendil-works/pi-ai";
 import {
   type ExtensionAPI,
   getMarkdownTheme,
   withFileMutationQueue,
+  AuthStorage,
+  createAgentSession,
+  ModelRegistry,
+  SessionManager,
+  type AgentSession,
 } from "@earendil-works/pi-coding-agent";
 import {
   Container,
@@ -67,9 +73,16 @@ interface AgentJob {
     turns: number;
   };
   model?: string;
+  /** Model explicitly requested for this agent (from hive_spawn params) */
+  requestedModel?: string;
+  /** Thinking level explicitly requested for this agent */
+  requestedThinking?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
   startedAt: number;
   endedAt?: number;
-  process?: ChildProcess;
+  /** SDK session for in-process sub-agent (replaces child process) */
+  session?: AgentSession;
+  /** Abort controller for steering/followup */
+  abortController?: AbortController;
 }
 
 interface AgentDefinitionInput {
@@ -78,6 +91,10 @@ interface AgentDefinitionInput {
   systemPrompt: string;
   task: string;
   cwd?: string;
+  /** Model to use for this agent (e.g., "gpt-5.4", "claude-sonnet-4-5", "openai/gpt-5.4") */
+  model?: string;
+  /** Thinking level for this agent */
+  thinking?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
 }
 
 // ─── Globals ──────────────────────────────────────────────────────────────
@@ -151,51 +168,6 @@ function getFinalOutput(messages: Message[]): string {
   return "";
 }
 
-function getPiInvocation(args: string[]): { command: string; args: string[] } {
-  const currentScript = process.argv[1];
-  if (currentScript && fs.existsSync(currentScript)) {
-    return { command: process.execPath, args: [currentScript, ...args] };
-  }
-  const execName = path.basename(process.execPath).toLowerCase();
-  if (!/^(node|bun)(\.exe)?$/.test(execName)) {
-    return { command: process.execPath, args };
-  }
-  return { command: "pi", args };
-}
-
-async function writeSystemPrompt(
-  name: string,
-  content: string,
-): Promise<{ dir: string; filePath: string }> {
-  const tmpDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-hive-"));
-  const safeName = name.replace(/[^\w.-]+/g, "_");
-  const filePath = path.join(tmpDir, `prompt-${safeName}.md`);
-  await withFileMutationQueue(filePath, async () => {
-    await fs.promises.writeFile(filePath, content, {
-      encoding: "utf-8",
-      mode: 0o600,
-    });
-  });
-  return { dir: tmpDir, filePath };
-}
-
-function cleanupTemp(dir: string | null, file: string | null) {
-  if (file) {
-    try {
-      fs.unlinkSync(file);
-    } catch {
-      /* ignore */
-    }
-  }
-  if (dir) {
-    try {
-      fs.rmdirSync(dir);
-    } catch {
-      /* ignore */
-    }
-  }
-}
-
 // ─── Widget ───────────────────────────────────────────────────────────────
 
 /**
@@ -251,13 +223,18 @@ function updateWidget() {
         job.usage.cost > 0
           ? theme.fg("dim", `$${job.usage.cost.toFixed(4)}`)
           : "";
+      const modelStr = job.requestedModel
+        ? theme.fg("accent", job.requestedModel)
+        : job.model
+          ? theme.fg("dim", job.model)
+          : "";
       // Show current activity for running agents (truncated)
       const activityStr =
         job.status === "running" || job.status === "spawning"
           ? `  ${theme.fg("dim", `› ${job.currentActivity.slice(0, 80)}`)}`
           : "";
 
-      lines.push(`   ${nameStr} ${roleStr}  ${elapsedStr} ${jobCost}${activityStr}`);
+      lines.push(`   ${nameStr} ${roleStr}  ${elapsedStr} ${jobCost}${modelStr ? `  ${modelStr}` : ""}${activityStr}`);
     }
 
     return {
@@ -271,110 +248,116 @@ function updateWidget() {
 
 // ─── Spawn a single agent ─────────────────────────────────────────────────
 
+// ─── Spawn a single agent (SDK-based) ─────────────────────────────────────
+
 async function spawnAgentJob(
   cwd: string,
   job: AgentJob,
-  signal: AbortSignal | undefined,
 ): Promise<void> {
-  const args: string[] = ["--mode", "json", "-p", "--no-session"];
-  let tmpDir: string | null = null;
-  let tmpPath: string | null = null;
-
   try {
+    const authStorage = AuthStorage.create();
+    const modelRegistry = ModelRegistry.create(authStorage);
+
+    // Resolve model if specified
+    let model = undefined;
+    if (job.requestedModel) {
+      // Try to find the model (supports "provider/id" format)
+      const parts = job.requestedModel.includes("/")
+        ? job.requestedModel.split("/")
+        : ["", job.requestedModel];
+      const provider = parts[0];
+      const modelId = parts[1] || parts[0];
+
+      // If no provider specified, try all available models
+      if (!provider) {
+        const available = await modelRegistry.getAvailable();
+        const found = available.find((m: any) =>
+          m.id.includes(modelId) || modelId.includes(m.id),
+        );
+        if (found) model = found;
+      } else {
+        const found = modelRegistry.find(provider, modelId);
+        if (found) model = found;
+      }
+    }
+
     const systemPromptFull =
       `You are a specialized agent with this role: ${job.role}\n\n${job.systemPrompt}`;
-    const tmp = await writeSystemPrompt(job.name, systemPromptFull);
-    tmpDir = tmp.dir;
-    tmpPath = tmp.filePath;
-    args.push("--append-system-prompt", tmpPath);
-    args.push(job.task);
 
-    const invocation = getPiInvocation(args);
-    const proc = spawn(invocation.command, invocation.args, {
+    const { session } = await createAgentSession({
       cwd,
-      shell: false,
-      stdio: ["ignore", "pipe", "pipe"],
+      sessionManager: SessionManager.inMemory(),
+      authStorage,
+      modelRegistry,
+      model,
+      thinkingLevel: job.requestedThinking,
+      systemPromptOverride: () => systemPromptFull,
     });
 
+    job.session = session;
+    job.abortController = new AbortController();
     job.status = "running";
-    job.process = proc;
     job.currentActivity = "waiting for model…";
     updateWidget();
 
-    let buffer = "";
-
-    const processLine = (line: string) => {
-      if (!line.trim()) return;
-      let event: any;
-      try {
-        event = JSON.parse(line);
-      } catch {
-        return;
-      }
-
-      // Tool call started — update current activity
-      if (event.type === "tool_execution_start" && event.message) {
-        const msg = event.message;
-        const toolCall = msg.content?.find(
-          (c: any) => c.type === "tool_use",
-        );
-        if (toolCall) {
-          const toolName = toolCall.name || "unknown";
-          const input = toolCall.input || {};
-          // Build a human-readable activity string
-          let activity = toolName;
-          if (toolName === "bash" && input.command) {
-            const cmd =
-              input.command.length > 50
-                ? input.command.slice(0, 50) + "…"
-                : input.command;
-            activity = `bash: $ ${cmd}`;
-          } else if (toolName === "read" && input.path) {
-            activity = `read: ${input.path}`;
-          } else if (toolName === "write" && input.path) {
-            activity = `write: ${input.path}`;
-          } else if (toolName === "edit" && input.path) {
-            activity = `edit: ${input.path}`;
-          } else if (toolName === "grep" && input.pattern) {
-            activity = `grep: /${input.pattern}/`;
-          } else if (toolName === "find" && input.pattern) {
-            activity = `find: ${input.pattern}`;
-          } else if (toolName === "ls" && input.path) {
-            activity = `ls: ${input.path}`;
-          }
-          job.currentActivity = activity;
-          job.messages.push(msg);
-          updateWidget();
+    // Subscribe to events for progress tracking
+    const unsubscribe = session.subscribe((event: any) => {
+      // Tool call started
+      if (event.type === "tool_execution_start") {
+        const toolName = event.toolName || "unknown";
+        const args = event.args || {};
+        let activity = toolName;
+        if (toolName === "bash" && args.command) {
+          const cmd =
+            args.command.length > 50
+              ? args.command.slice(0, 50) + "…"
+              : args.command;
+          activity = `bash: $ ${cmd}`;
+        } else if (toolName === "read" && args.path) {
+          activity = `read: ${args.path}`;
+        } else if (toolName === "write" && args.path) {
+          activity = `write: ${args.path}`;
+        } else if (toolName === "edit" && args.path) {
+          activity = `edit: ${args.path}`;
+        } else if (toolName === "grep" && args.pattern) {
+          activity = `grep: /${args.pattern}/`;
+        } else if (toolName === "find" && args.pattern) {
+          activity = `find: ${args.pattern}`;
+        } else if (toolName === "ls" && args.path) {
+          activity = `ls: ${args.path}`;
         }
-      }
-
-      // Tool result — add to messages
-      if (event.type === "tool_result_end" && event.message) {
-        job.messages.push(event.message as Message);
+        job.currentActivity = activity;
         updateWidget();
       }
 
       // Streaming text output
-      if (event.type === "message_update" && event.message) {
-        const delta = event.message.content?.find(
-          (c: any) => c.type === "text" && c.text,
-        );
+      if (
+        event.type === "message_update" &&
+        event.assistantMessageEvent?.type === "text_delta"
+      ) {
+        const delta = event.assistantMessageEvent.delta;
         if (delta) {
-          job.streamingText += delta.text;
-          // Show first 80 chars of streaming output as activity
-          const preview = job.streamingText.slice(0, 80).replace(/\n/g, " ");
-          if (!job.currentActivity.startsWith("bash:") && !job.currentActivity.startsWith("read:") && !job.currentActivity.startsWith("write:")) {
-            job.currentActivity = preview ? `typing: ${preview}…` : "thinking…";
+          job.streamingText += delta;
+          const preview = job.streamingText
+            .slice(0, 80)
+            .replace(/\n/g, " ");
+          if (
+            !job.currentActivity.startsWith("bash:") &&
+            !job.currentActivity.startsWith("read:") &&
+            !job.currentActivity.startsWith("write:")
+          ) {
+            job.currentActivity = preview
+              ? `typing: ${preview}…`
+              : "thinking…";
           }
           updateWidget();
         }
       }
 
-      // Assistant message completed
+      // Message completed
       if (event.type === "message_end" && event.message) {
         const msg = event.message as Message;
         job.messages.push(msg);
-        // Clear streaming text for next turn
         job.streamingText = "";
         job.currentActivity = "thinking…";
         if (msg.role === "assistant") {
@@ -393,66 +376,45 @@ async function spawnAgentJob(
         updateWidget();
       }
 
-      // Agent started
-      if (event.type === "agent_start") {
-        job.currentActivity = "starting…";
-        updateWidget();
-      }
-    };
-
-    proc.stdout.on("data", (data: Buffer) => {
-      buffer += data.toString();
-      const lines = buffer.split("\n");
-      buffer = lines.pop() || "";
-      for (const line of lines) processLine(line);
-    });
-
-    proc.stderr.on("data", (data: Buffer) => {
-      job.stderr += data.toString();
-    });
-
-    proc.on("close", (code: number | null) => {
-      if (buffer.trim()) processLine(buffer);
-      job.status = code === 0 ? "done" : "failed";
-      job.endedAt = Date.now();
-      job.process = undefined;
-      cleanupTemp(tmpDir, tmpPath);
-      updateWidget();
-      // Notify orchestrator immediately
-      notifiedIds.add(job.id);
-      notifyOrchestrator(job);
-    });
-
-    proc.on("error", () => {
-      job.status = "failed";
-      job.endedAt = Date.now();
-      job.process = undefined;
-      cleanupTemp(tmpDir, tmpPath);
-      updateWidget();
-      notifiedIds.add(job.id);
-      notifyOrchestrator(job);
-    });
-
-    if (signal) {
-      const killProc = () => {
-        job.status = "cancelled";
+      // Agent completed
+      if (event.type === "agent_end") {
+        job.status = "done";
         job.endedAt = Date.now();
-        proc.kill("SIGTERM");
-        setTimeout(() => {
-          if (!proc.killed) proc.kill("SIGKILL");
-        }, 5000);
-        cleanupTemp(tmpDir, tmpPath);
+        job.session = undefined;
+        unsubscribe();
         updateWidget();
-      };
-      if (signal.aborted) killProc();
-      else signal.addEventListener("abort", killProc, { once: true });
+        notifiedIds.add(job.id);
+        notifyOrchestrator(job);
+      }
+    });
+
+    // Run the initial prompt
+    await session.prompt(job.task, {
+      streamingBehavior: "steer",
+    });
+
+    // If we get here without agent_end event, check state
+    if (job.status === "running") {
+      job.status = "done";
+      job.endedAt = Date.now();
+      job.session = undefined;
+      unsubscribe();
+      updateWidget();
+      notifiedIds.add(job.id);
+      notifyOrchestrator(job);
     }
-  } catch (err) {
-    job.status = "failed";
+  } catch (err: any) {
+    if (err?.message?.includes("abort")) {
+      job.status = "cancelled";
+    } else {
+      job.status = "failed";
+      job.stderr = String(err);
+    }
     job.endedAt = Date.now();
-    job.stderr = String(err);
-    cleanupTemp(tmpDir, tmpPath);
+    job.session = undefined;
     updateWidget();
+    notifiedIds.add(job.id);
+    notifyOrchestrator(job);
   }
 }
 
@@ -482,10 +444,6 @@ function notifyOrchestrator(job: AgentJob) {
     { deliverAs: "steer", triggerTurn: true },
   );
 }
-
-/**
- * Check all agents and notify the orchestrator about newly completed agents.
- */
 function pollAgentStatus() {
   const allAgents = Array.from(agents.values());
   const running = allAgents.filter(
@@ -767,6 +725,14 @@ function createAgentViewer(
 
 // ─── Tool Schema ──────────────────────────────────────────────────────────
 
+const ThinkingLevelSchema = StringEnum(
+  ["off", "minimal", "low", "medium", "high", "xhigh"] as const,
+  {
+    description:
+      "Thinking/reasoning level for this agent. Use 'xhigh' or 'high' for complex reasoning, 'off' for simple tasks. Default: agent uses its own default.",
+  },
+);
+
 const AgentDefinitionSchema = Type.Object({
   name: Type.String({
     description:
@@ -784,12 +750,13 @@ const AgentDefinitionSchema = Type.Object({
     description:
       "The specific task or question for this agent. Include relevant context, file paths, requirements, and expected output format.",
   }),
-  cwd: Type.Optional(
+  model: Type.Optional(
     Type.String({
       description:
-        "Working directory for this agent (defaults to current project root)",
+        'Model to use for this agent (e.g., "gpt-5.4", "claude-sonnet-4-5", "openai/gpt-5.4"). Use cheaper models for simple tasks, smarter models for complex reasoning.',
     }),
   ),
+  thinking: Type.Optional(ThinkingLevelSchema),
 });
 
 const HiveSpawnParams = Type.Object({
@@ -846,11 +813,12 @@ export default function (pi: ExtensionAPI) {
     savedCtx = ctx;
     savedPi = pi;
 
-    // Kill any stale agents from previous session
+    // Dispose any stale sessions from previous session
     for (const job of agents.values()) {
-      if (job.process) {
+      if (job.session) {
         try {
-          job.process.kill("SIGTERM");
+          job.session.abort();
+          job.session.dispose();
         } catch {
           /* ignore */
         }
@@ -867,11 +835,12 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("session_shutdown", async (_event, _ctx) => {
-    // Kill all running agents
+    // Dispose all running sessions
     for (const job of agents.values()) {
-      if (job.process) {
+      if (job.session) {
         try {
-          job.process.kill("SIGTERM");
+          job.session.abort();
+          job.session.dispose();
         } catch {
           /* ignore */
         }
@@ -978,6 +947,8 @@ ${completedLines}
           stderr: "",
           currentActivity: "initializing…",
           streamingText: "",
+          requestedModel: def.model,
+          requestedThinking: def.thinking,
           usage: {
             input: 0,
             output: 0,
@@ -992,7 +963,7 @@ ${completedLines}
         agents.set(id, job);
 
         // Spawn each agent in background (non-blocking)
-        spawnAgentJob(ctx.cwd, job, undefined).catch((err) => {
+        spawnAgentJob(ctx.cwd, job).catch((err) => {
           job.status = "failed";
           job.stderr = String(err);
           job.endedAt = Date.now();
@@ -1116,6 +1087,7 @@ ${completedLines}
         const output = getFinalOutput(job.messages);
         const resultText = [
           `## Agent: ${job.name} (${job.role})`,
+          `Model: ${job.requestedModel || job.model || "default"}`,
           `Status: ${job.status}`,
           `Elapsed: ${getElapsed(job)}`,
           `Usage: ${formatUsage(job.usage, job.model)}`,
@@ -1157,8 +1129,9 @@ ${completedLines}
       if (running.length > 0) {
         sections.push("### ⏳ Still Running");
         for (const job of running) {
+          const modelInfo = job.requestedModel ? ` (${job.requestedModel})` : "";
           sections.push(
-            `**${job.name}** (${job.role}) — ${job.currentActivity} | ${getElapsed(job)} | $${job.usage.cost.toFixed(4)}`,
+            `**${job.name}**${modelInfo} (${job.role}) — ${job.currentActivity} | ${getElapsed(job)} | $${job.usage.cost.toFixed(4)}`,
           );
         }
         sections.push("");
@@ -1182,7 +1155,8 @@ ${completedLines}
         sections.push("");
         for (const job of completed) {
           const output = getFinalOutput(job.messages);
-          sections.push(`--- **${job.name}** (${job.role}) ---`);
+          const modelInfo = job.requestedModel ? ` (${job.requestedModel})` : "";
+          sections.push(`--- **${job.name}**${modelInfo} (${job.role}) ---`);
           sections.push(`Task: ${job.task}`);
           sections.push(`Usage: ${formatUsage(job.usage, job.model)}`);
           sections.push("");
@@ -1259,6 +1233,254 @@ ${completedLines}
     },
   });
 
+  // ── Register hive_steer tool ──────────────────────────────────────────
+
+  pi.registerTool({
+    name: "hive_steer",
+    label: "Hive Steer — Send Instruction to Running Agent",
+    description: [
+      "Send a steering instruction to a running sub-agent. The agent will receive this immediately and adjust its work.",
+      "Use this to correct direction, add requirements, or redirect an agent's focus mid-task.",
+    ].join(" "),
+    promptGuidelines: [
+      "Use hive_steer to correct or redirect a running agent.",
+      "The agent will receive the instruction immediately.",
+    ],
+    parameters: Type.Object({
+      agent: Type.String({
+        description: "Name of the agent to steer (must be currently running).",
+      }),
+      instruction: Type.String({
+        description:
+          "The new instruction or correction to give the agent. Be specific about what to change or add.",
+      }),
+    }),
+
+    async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
+      const agentName = (params as any).agent as string;
+      const instruction = (params as any).instruction as string;
+
+      const job = Array.from(agents.values()).find(
+        (j) => j.name === agentName,
+      );
+      if (!job) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `No agent named "${agentName}". Use hive_inbox to see all agents.`,
+            },
+          ],
+          details: {},
+        };
+      }
+      if (job.status !== "running" && job.status !== "spawning") {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Agent "${agentName}" is ${job.status} (not running). Cannot steer a finished agent.`,
+            },
+          ],
+          details: {},
+        };
+      }
+      if (!job.session) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Agent "${agentName}" has no active session. It may be finishing up.`,
+            },
+          ],
+          details: {},
+        };
+      }
+
+      try {
+        await job.session.steer(instruction);
+        job.currentActivity = `steered: ${instruction.slice(0, 60)}…`;
+        updateWidget();
+        return {
+          content: [
+            {
+              type: "text",
+              text: `✅ Steered **${agentName}**: "${instruction}"`,
+            },
+          ],
+          details: { agent: agentName, status: "steered" },
+        };
+      } catch (err: any) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Failed to steer ${agentName}: ${err.message}`,
+            },
+          ],
+          details: { agent: agentName, status: "steer_failed" },
+          isError: true,
+        };
+      }
+    },
+
+    renderCall(args: any, theme: any) {
+      const preview =
+        args.instruction.length > 50
+          ? args.instruction.slice(0, 50) + "…"
+          : args.instruction;
+      return new Text(
+        theme.fg("toolTitle", theme.bold("hive_steer ")) +
+          theme.fg("accent", args.agent) +
+          theme.fg("dim", ` — ${preview}`),
+        0,
+        0,
+      );
+    },
+
+    renderResult(result: any, _options: any, theme: any) {
+      const details = result.details as
+        | { agent?: string; status?: string }
+        | undefined;
+      if (details?.status === "steer_failed") {
+        return new Text(
+          theme.fg("error", `✗ steer failed for ${details.agent}`),
+          0,
+          0,
+        );
+      }
+      return new Text(
+        theme.fg("success", `✅ steered ${details?.agent || "agent"}`),
+        0,
+        0,
+      );
+    },
+  });
+
+  // ── Register hive_followup tool ───────────────────────────────────────
+
+  pi.registerTool({
+    name: "hive_followup",
+    label: "Hive Followup — Queue Instruction for Agent",
+    description: [
+      "Queue an instruction for a running agent. The agent will process it after completing its current work.",
+      "Use this to add additional tasks or context without interrupting the current work.",
+    ].join(" "),
+    promptGuidelines: [
+      "Use hive_followup to add tasks without interrupting an agent.",
+      "The agent will process the followup after its current turn.",
+    ],
+    parameters: Type.Object({
+      agent: Type.String({
+        description: "Name of the agent to queue a followup for.",
+      }),
+      instruction: Type.String({
+        description:
+          "The instruction to queue. The agent will process it after current work.",
+      }),
+    }),
+
+    async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
+      const agentName = (params as any).agent as string;
+      const instruction = (params as any).instruction as string;
+
+      const job = Array.from(agents.values()).find(
+        (j) => j.name === agentName,
+      );
+      if (!job) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `No agent named "${agentName}". Use hive_inbox to see all agents.`,
+            },
+          ],
+          details: {},
+        };
+      }
+      if (job.status !== "running" && job.status !== "spawning") {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Agent "${agentName}" is ${job.status}. Cannot queue followup for a finished agent.`,
+            },
+          ],
+          details: {},
+        };
+      }
+      if (!job.session) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Agent "${agentName}" has no active session.`,
+            },
+          ],
+          details: {},
+        };
+      }
+
+      try {
+        await job.session.followUp(instruction);
+        job.currentActivity = `followup queued: ${instruction.slice(0, 60)}…`;
+        updateWidget();
+        return {
+          content: [
+            {
+              type: "text",
+              text: `✅ Queued followup for **${agentName}**: "${instruction}"`,
+            },
+          ],
+          details: { agent: agentName, status: "queued" },
+        };
+      } catch (err: any) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Failed to queue followup for ${agentName}: ${err.message}`,
+            },
+          ],
+          details: { agent: agentName, status: "followup_failed" },
+          isError: true,
+        };
+      }
+    },
+
+    renderCall(args: any, theme: any) {
+      const preview =
+        args.instruction.length > 50
+          ? args.instruction.slice(0, 50) + "…"
+          : args.instruction;
+      return new Text(
+        theme.fg("toolTitle", theme.bold("hive_followup ")) +
+          theme.fg("accent", args.agent) +
+          theme.fg("dim", ` — ${preview}`),
+        0,
+        0,
+      );
+    },
+
+    renderResult(result: any, _options: any, theme: any) {
+      const details = result.details as
+        | { agent?: string; status?: string }
+        | undefined;
+      if (details?.status === "followup_failed") {
+        return new Text(
+          theme.fg("error", `✗ followup failed for ${details.agent}`),
+          0,
+          0,
+        );
+      }
+      return new Text(
+        theme.fg("success", `✅ followup queued for ${details?.agent || "agent"}`),
+        0,
+        0,
+      );
+    },
+  });
+
   // ── Register /hive command ────────────────────────────────────────────
 
   pi.registerCommand("hive", {
@@ -1281,9 +1503,10 @@ ${completedLines}
       for (const job of agents.values()) {
         if (
           (job.status === "running" || job.status === "spawning") &&
-          job.process
+          job.session
         ) {
-          job.process.kill("SIGTERM");
+          job.session.abort();
+          job.session.dispose();
           job.status = "cancelled";
           job.endedAt = Date.now();
           killed++;
